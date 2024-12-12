@@ -2,19 +2,21 @@ from manimlib import *
 from manimlib.utils.color import random_bright_color
 from pyglet.window import key
 from pyperclip import copy
+from pathlib import Path
 import mido
 
-def get_path_between_pads(start, end, max_height=None, resolution=None):
+
+def get_path_between_pads(start, end, max_height=None, time=1):
     start = np.array(start)
     end = np.array(end)
     end -= start
 
     full_dist = np.linalg.norm(end)
-    resolution = max(2, int(resolution * 50))
+    resolution = max(2, int(PATH_RESOLUTION * time/RUN_TIME))
 
     # if full dist is close to 0, then return a straight line
     if full_dist.round(3) == 0:
-        return np.vstack((start, end))
+        return np.vstack((start, start))
 
     dists = np.linspace(0, full_dist, resolution)
     heights = np.array([])
@@ -31,8 +33,77 @@ def get_path_between_pads(start, end, max_height=None, resolution=None):
     return offset
 
 
-def get_notes(file_path):
-    mid = mido.MidiFile(file_path)
+def create_pads(self, axes, animate=True):
+    init_pos = axes.c2p(0, 0, 0.01)
+    pads = [Square3D(1, color=BLUE).move_to(init_pos) for _ in range(NUM_NOTES)]
+    self.add(*pads)
+    if animate:
+        self.play(
+            *(pad.animate.move_to(axes.c2p(NOTES[i][0], NOTES[i][1]*Y_AXIS_SCALE, 0.01)) for i, pad in enumerate(pads)),
+            run_time=2
+        )
+
+    return pads
+
+
+def calculate_paths(axes, pads):
+    pad_locs = np.array([np.array(list(axes.p2c(pad.get_center()))) for pad in pads])
+    paths = {}
+    for i in range(AGENTS):
+        ball = Sphere(radius=0.2, color=random_bright_color())
+        init_pos = (i-AGENTS/2, -12, 0.01)
+        ball.move_to(axes.c2p(*init_pos))
+        paths[ball] = [init_pos]
+
+    for i in range(len(pad_locs)):
+        balls = list(paths.keys())
+
+        def score(agent):
+            prev_loc = paths[agent][-1]
+            proximity = np.abs(prev_loc - pad_locs[i])
+            x_proximity = proximity[0]
+            y_proximity = proximity[1]
+
+            return x_proximity - y_proximity
+
+        best = sorted(balls, key=score)[0]
+        paths[best].append(pad_locs[i])
+
+    for ball, locs in paths.items():
+        if len(locs) == 0:
+            continue
+        start_path = get_path_between_pads(
+            axes.c2p(*locs[0]),
+            axes.c2p(*locs[1]),
+            time=RUNUP_TIME + locs[1][1]/Y_AXIS_SCALE
+        )
+        for i in range(2, len(locs)):
+            start_path = np.concatenate((
+                start_path,
+                get_path_between_pads(
+                    axes.c2p(*locs[i-1]),
+                    axes.c2p(*locs[i]),
+                    time=(locs[i][1]-locs[i-1][1])/Y_AXIS_SCALE
+                )
+            ))
+        
+        start_path = np.concatenate((
+            start_path,
+            get_path_between_pads(
+                axes.c2p(*locs[-1]),
+                axes.c2p(*pad_locs[-1]),
+                time=(pad_locs[-1][1]-locs[-1][1])/Y_AXIS_SCALE
+            )
+        ))
+        start_path[:, 2] += ball.get_width()/2
+        paths[ball] = VMobject()
+        paths[ball].set_points_as_corners(start_path)
+
+    return paths
+
+
+def get_notes():
+    mid = mido.MidiFile(MIDI_FILE)
     notes = []
     max_simul_notes = 0
     simul_notes = 0
@@ -56,7 +127,7 @@ def get_notes(file_path):
                         start_keys[msg.note - 21] = time
 
             max_simul_notes = max(max_simul_notes, simul_notes)
-    
+
     relevant_notes = []
     for note in notes:
         if note["start"] is not None:
@@ -64,64 +135,23 @@ def get_notes(file_path):
 
     relevant_notes = np.array(relevant_notes)
     relevant_notes[:, 0] -= np.average(relevant_notes[:, 0])
-    relevant_notes[:, 1] *= 16
 
     return relevant_notes, max_simul_notes
 
 
-def create_pads(self, axes, notes, animate=True):
-    init_pos = axes.c2p(*np.average(notes, axis=0), 10)
-    # init_pos = axes.c2p(0, 0, 0.01)
-    pads = [Square3D(1, color=BLUE).move_to(init_pos) for _ in range(len(notes))]
-    self.add(*pads)
-    if animate:
-        self.play(*(pad.animate.move_to(axes.c2p(notes[i][0], notes[i][1], 0.01)) for i, pad in enumerate(pads)))
-
-    return pads
-
-
-def calculate_paths(axes, notes, agents=1):
-    paths = {}
-    for i in range(agents):
-        ball = Sphere(radius=0.2, color=random_bright_color())
-        init_pos = axes.c2p(i-agents/2, 0, 0.01)
-        paths[ball] = [init_pos[:2]]
-
-    for i in range(len(notes)):
-        # which agent is the best to take this note?
-        agents = list(paths.keys())
-        
-        def score(agent):
-            prev_loc = paths[agent][-1]
-            proximity = np.abs(prev_loc - notes[i])
-            x_proximity = proximity[0]
-            y_proximity = proximity[1]
-
-            return x_proximity - y_proximity
-
-        best = sorted(agents, key=score)[0]
-        paths[best].append(notes[i])
-
-    for ball, locs in paths.items():
-        if len(locs) == 0:
-            continue
-        start_path = np.array([list(axes.c2p(locs[0][0], locs[0][1], 0.01))])
-        ball.move_to(start_path[0])
-        for i in range(1, len(locs)):
-            start_path = np.concatenate((
-                start_path,
-                get_path_between_pads(axes.c2p(locs[i-1][0], locs[i-1][1], 0.01), axes.c2p(locs[i][0], locs[i][1], 0.01), resolution=locs[i][1]-locs[i-1][1])
-            ))
-        
-        start_path = np.concatenate((
-            start_path,
-            get_path_between_pads(axes.c2p(locs[-1][0], locs[-1][1], 0.01), axes.c2p(notes[-1][0], notes[-1][1], 0.01), resolution=notes[-1][1]-locs[-1][1])
-        ))
-        start_path[:, 2] += ball.get_width()/2
-        paths[ball] = VMobject()
-        paths[ball].set_points_as_corners(start_path)
-
-    return paths
+Y_AXIS_SCALE = 16
+RUNUP_TIME = 1
+MIDI_FILE = Path.home() / "Downloads" / "piano.mid"
+NOTES, AGENTS = get_notes()
+# AGENTS = 10  # for 10 fingers on complicated piano music
+print(NOTES)
+print(AGENTS)
+NUM_NOTES = len(NOTES)
+MIN_NOTE = np.min(NOTES[:, 1])
+MAX_NOTE = np.max(NOTES[:, 1])
+NOTES_RANGE = MAX_NOTE - MIN_NOTE
+RUN_TIME = MAX_NOTE + RUNUP_TIME
+PATH_RESOLUTION = NUM_NOTES * 25
 
 
 class Musimation(ThreeDScene):
@@ -133,28 +163,17 @@ class Musimation(ThreeDScene):
             y_range=[-5, length, 1],
         )
 
-        # self.frame.reorient(4.1e+01, 6.8e+01, 4.8e-14, (12.0, -14.3, 4.1), 3.1e+01)
-        self.frame.reorient(4.1e+01, 6.8e+01, 5.1e-14, (4.2, -28.0, 2.0), 3.6e+01)
+        self.frame.reorient(3.4e+01, 7.1e+01, 6.7e-14, (11.0, -29.0, 0.93), 2.6e+01)
 
-        # notes = [(freq, time)]
-        notes, agents = get_notes(Path.home() / "Downloads" / "piano.mid")
-
-        min_note = np.min(notes[:, 1])
-        max_note = np.max(notes[:, 1])
-
-        pads: list[Square3D] = create_pads(self, axes, notes)
+        pads: list[Square3D] = create_pads(self, axes)
 
         # {Ball: VMobject}
-        paths = calculate_paths(axes, notes, agents=agents)
+        paths = calculate_paths(axes, pads)
 
         balls = list(paths.keys())
         path_points = list(paths.values())
 
-        self.play(*(ShowCreation(path) for path in path_points))
-        self.play(
-            *(FadeOut(path) for path in path_points),
-            *(FadeIn(ball) for ball in balls)
-        )
+        self.play(*(FadeIn(ball) for ball in balls))
 
         self.add(*[
             TracingTail(
@@ -169,13 +188,15 @@ class Musimation(ThreeDScene):
                 MoveAlongPath(ball, path, rate_func=linear)
                 for ball, path in zip(balls, path_points)
             ),
-            # self.frame.animate.reorient(3.3e+01, 5.7e+01, -3.2e-15, (11.0, 96.0, 8.6), 3e+01),
-            self.frame.animate.set_y(max_note-(min_note-self.frame.get_y())+15),
-            run_time=max_note/16,
+            self.frame.animate.set_y(NOTES_RANGE*Y_AXIS_SCALE+self.frame.get_y()+20),
+            run_time=RUN_TIME,
             rate_func=linear
         )
 
-        self.play(*(FadeOut(ball) for ball in balls))
+        self.play(
+            *(FadeOut(ball) for ball in balls),
+            *(FadeOut(pad) for pad in pads),
+        )
 
 
     def on_key_press(self, symbol: int, modifiers: int) -> None:
